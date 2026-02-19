@@ -1,0 +1,135 @@
+name: '🧱 Manual DRYWALL-TAKEOFF Orchestrator Build and Deploy'
+
+on:
+  # Manual trigger for the Cloud Run deployment
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: 'Select environment (dev or prod)'
+        required: true
+        type: choice
+        options:
+          - dev
+          - prod
+
+jobs:
+  build-and-deploy:
+    name: 'Build, Push and Deploy DRYWALL-TAKEOFF Orchestrator'
+    runs-on: ubuntu-latest
+    environment: ${{ github.event.inputs.environment }}
+
+    steps:
+      - name: 'Checkout Code'
+        uses: actions/checkout@v2
+
+      # Authenticate to Google Cloud
+      - name: 'Authenticate to Google Cloud'
+        uses: google-github-actions/auth@v2
+        with:
+          credentials_json: ${{ github.event.inputs.environment == 'prod' && secrets.GOOGLE_CREDENTIALS_PROD || secrets.GOOGLE_CREDENTIALS_DEV }}
+
+      # Set up GCP Project ID 
+      - name: "Set GCP Project ID"
+        run: |
+          if [ "${{ github.event.inputs.environment }}" == "prod" ]; then
+            echo "GCP_PROJECT_ID=${{ vars.GCP_PROJECT_ID_PROD }}" >> $GITHUB_ENV
+          else
+            echo "GCP_PROJECT_ID=${{ vars.GCP_PROJECT_ID_DEV }}" >> $GITHUB_ENV
+          fi
+
+      # Set up Google Cloud SDK
+      - name: 'Set up Google Cloud SDK'
+        uses: google-github-actions/setup-gcloud@v2
+        with:
+          project_id: ${{ env.GCP_PROJECT_ID }}
+
+      # Docker Authentication with Artifact Registry
+      - name: Docker Authentication
+        run: |
+          gcloud auth print-access-token | docker login -u oauth2accesstoken --password-stdin https://gcr.io
+
+      # Set up VPC Access Connector
+      - name: "Set VPC Access Connector"
+        run: |
+          if [ "${{ github.event.inputs.environment }}" == "prod" ]; then
+            echo "VPC_ACCESS_CONNECTOR=${{ vars.VPC_ACCESS_CONNECTOR_PROD }}" >> $GITHUB_ENV
+          else
+            echo "VPC_ACCESS_CONNECTOR=${{ vars.VPC_ACCESS_CONNECTOR_DEV }}" >> $GITHUB_ENV
+          fi
+
+      # Set up GCP Service Account
+      - name: "Set GCP Service Account"
+        run: |
+          if [ "${{ github.event.inputs.environment }}" == "prod" ]; then
+            echo "GCP_SERVICE_ACCOUNT=${{ vars.GCP_SERVICE_ACCOUNT_PROD }}" >> $GITHUB_ENV
+          else
+            echo "GCP_SERVICE_ACCOUNT=${{ vars.GCP_SERVICE_ACCOUNT_DEV }}" >> $GITHUB_ENV
+          fi
+
+      # Build the DRYWALL-TAKEOFF Docker image for Cloud Run
+      - name: 'Build Docker Image for DRYWALL-TAKEOFF'
+        working-directory: drywall-takeoff-3d
+        run: |
+          docker build \
+            -t gcr.io/${{ env.GCP_PROJECT_ID }}/${{ vars.IMAGE_NAME_DRYWALL_TAKEOFF_3D }} \
+            .
+
+      # Push the DRYWALL-TAKEOFF Docker image to Google Container Registry
+      - name: 'Push Docker Image for DRYWALL-TAKEOFF to GCR'
+        run: |
+          docker push gcr.io/${{ env.GCP_PROJECT_ID }}/${{ vars.IMAGE_NAME_DRYWALL_TAKEOFF_3D }}
+
+      # Deploy DRYWALL-TAKEOFF to Cloud Run
+      - name: 'Deploy DRYWALL-TAKEOFF to Cloud Run'
+        run: |
+          gcloud run deploy drywall-takeoff-3d-fbm \
+            --image gcr.io/${{ env.GCP_PROJECT_ID }}/${{ vars.IMAGE_NAME_DRYWALL_TAKEOFF_3D }} \
+            --platform managed \
+            --region ${{ vars.REGION }} \
+            --project ${{ env.GCP_PROJECT_ID }} \
+            --cpu 8 \
+            --memory 32Gi \
+            --min-instances 20 \
+            --max-instances 100 \
+            --concurrency 5 \
+            --execution-environment gen2 \
+            --timeout 1800 \
+            --ingress internal-and-cloud-load-balancing  \
+            --vpc-connector ${{ env.VPC_ACCESS_CONNECTOR }} \
+            --vpc-egress private-ranges-only \
+            --service-account ${{ env.GCP_SERVICE_ACCOUNT }} \
+            --allow-unauthenticated
+
+      # Build the DRYWALL-WALL-DETECTOR Docker image for Cloud Run
+      - name: 'Build Docker Image for DRYWALL-WALL-DETECTOR'
+        working-directory: wall-detector
+        run: |
+          docker build \
+            -t gcr.io/${{ env.GCP_PROJECT_ID }}/${{ vars.IMAGE_NAME_DRYWALL_WALL_DETECTOR }} \
+            .
+
+      # Push the DRYWALL-WALL-DETECTOR Docker image to Google Container Registry
+      - name: 'Push Docker Image for DRYWALL-WALL-DETECTOR to GCR'
+        run: |
+          docker push gcr.io/${{ env.GCP_PROJECT_ID }}/${{ vars.IMAGE_NAME_DRYWALL_WALL_DETECTOR }}
+
+      # Deploy DRYWALL-WALL-DETECTOR to Cloud Run
+      - name: 'Deploy DRYWALL-WALL-DETECTOR to Cloud Run'
+        run: |
+          gcloud run deploy drywall-wall-detector \
+            --image gcr.io/${{ env.GCP_PROJECT_ID }}/${{ vars.IMAGE_NAME_DRYWALL_WALL_DETECTOR }} \
+            --platform managed \
+            --region ${{ vars.REGION }} \
+            --project ${{ env.GCP_PROJECT_ID }} \
+            --cpu 2 \
+            --memory 4Gi \
+            --min-instances 20 \
+            --max-instances 100 \
+            --concurrency 5 \
+            --execution-environment gen2 \
+            --timeout 300 \
+            --ingress internal-and-cloud-load-balancing \
+            --vpc-connector ${{ env.VPC_ACCESS_CONNECTOR }} \
+            --vpc-egress private-ranges-only \
+            --service-account ${{ env.GCP_SERVICE_ACCOUNT }} \
+            --allow-unauthenticated
