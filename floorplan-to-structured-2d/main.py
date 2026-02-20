@@ -22,9 +22,8 @@ from helper import (
     upload_floorplan,
     download_floorplan,
     insert_model_2d,
-    load_bigquery_client,
+    get_pg_pool,
 )
-
 
 def respond_with_UI_payload(payload, status_code=200):
     return JSONResponse(
@@ -76,6 +75,22 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+pg_pool = None
+
+@app.on_event("startup")
+async def startup():
+    global pg_pool
+    pg_pool = await get_pg_pool(CREDENTIALS)
+
+@app.on_event("shutdown")
+async def shutdown():
+    global pg_pool
+    if pg_pool:
+        await pg_pool.close()
+
+
 
 @app.post("/floorplan_to_structured_2d")
 async def floorplan_to_2d(request: Request):
@@ -152,8 +167,20 @@ async def floorplan_to_2d(request: Request):
                 offset=(0, 0),
                 contour_root_vertices=external_contour,
             )
-    bigquery_client = load_bigquery_client(CREDENTIALS)
-    insert_model_2d(
+    # bigquery_client = load_bigquery_client(CREDENTIALS)
+    # insert_model_2d(
+    #     dict(walls_2d=walls_2d, polygons=polygons, metadata=metadata),
+    #     floor_plan_modeller_2d.scale,
+    #     page_number,
+    #     plan_id,
+    #     user_id,
+    #     project_id,
+    #     floorplan_baseline_page_source,
+    #     bigquery_client,
+    #     CREDENTIALS
+    # )
+
+    await insert_model_2d(
         dict(walls_2d=walls_2d, polygons=polygons, metadata=metadata),
         floor_plan_modeller_2d.scale,
         page_number,
@@ -161,7 +188,7 @@ async def floorplan_to_2d(request: Request):
         user_id,
         project_id,
         floorplan_baseline_page_source,
-        bigquery_client,
+        pg_pool,
         CREDENTIALS
     )
     logging.info(f"SYSTEM: A 2D Model of the Floorplan from PAGE: {page_number} Generated Successfully")

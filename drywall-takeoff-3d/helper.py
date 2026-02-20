@@ -12,21 +12,46 @@ import vertexai
 from vertexai.generative_models import GenerativeModel, Part, Content
 
 from prompt import ARCHITECTURAL_DRAWING_CLASSIFIER
+import asyncpg
+import asyncio
 
 
-def load_bigquery_client(credentials):
-    bigquery_client = bigquery.Client.from_service_account_json(credentials["GBQServer"]["service_account_key"])
-    return bigquery_client
+_pg_pool = None
 
-def bigquery_run(credentials, bigquery_client, GBQ_query, job_config=dict()):
-    job_config = bigquery.QueryJobConfig(
-        destination_encryption_configuration=bigquery.EncryptionConfiguration(
-            kms_key_name=credentials["GBQServer"]["KMS_key"]
-        ),
-        **job_config
-    )
-    query_output = bigquery_client.query(GBQ_query, job_config=job_config)
-    return query_output
+async def get_pg_pool(credentials):
+    global _pg_pool
+    if _pg_pool is None:
+        _pg_pool = await asyncpg.create_pool(
+            host=credentials["PostgreSQL"]["host"],
+            port=credentials["PostgreSQL"]["port"],
+            database=credentials["PostgreSQL"]["database"],
+            user=credentials["PostgreSQL"]["user"],
+            password=credentials["PostgreSQL"]["password"],
+            min_size=2,
+            max_size=10
+        )
+    return _pg_pool
+
+def load_pg_pool_sync(credentials):
+    """Synchronous wrapper for startup — creates the pool once."""
+    loop = asyncio.get_event_loop()
+    return loop.run_until_complete(get_pg_pool(credentials))
+
+# def load_bigquery_client(credentials):
+#     bigquery_client = bigquery.Client.from_service_account_json(credentials["GBQServer"]["service_account_key"])
+#     return bigquery_client
+
+
+
+# def bigquery_run(credentials, bigquery_client, GBQ_query, job_config=dict()):
+#     job_config = bigquery.QueryJobConfig(
+#         destination_encryption_configuration=bigquery.EncryptionConfiguration(
+#             kms_key_name=credentials["GBQServer"]["KMS_key"]
+#         ),
+#         **job_config
+#     )
+#     query_output = bigquery_client.query(GBQ_query, job_config=job_config)
+#     return query_output
 
 def sha256(path, chunk_size=8192):
     sha256 = hashlib.sha256()
@@ -58,109 +83,163 @@ def upload_floorplan(plan_path, user_id, plan_id, project_id, credentials, index
     blob.upload_from_filename(plan_path)
     return f"gs://{credentials["CloudStorage"]["bucket_name"]}/{blob_path}"
 
-def insert_model_2d(
-    model_2d,
-    scale,
-    page_number,
-    plan_id,
-    user_id,
-    project_id,
-    GCS_URL_floorplan_page,
-    GCS_URL_target_drywalls_page,
-    bigquery_client,
-    credentials
-    ):
+# def insert_model_2d(
+#     model_2d,
+#     scale,
+#     page_number,
+#     plan_id,
+#     user_id,
+#     project_id,
+#     GCS_URL_floorplan_page,
+#     GCS_URL_target_drywalls_page,
+#     bigquery_client,
+#     credentials
+#     ):
+#     if not model_2d.get("metadata", None):
+#         GBQ_query = f"SELECT model_2d.metadata FROM `drywall_takeoff.models` WHERE LOWER(project_id) = LOWER('{project_id}') AND LOWER(plan_id) = LOWER('{plan_id}') AND page_number = {page_number};"
+#         query_output = bigquery_run(credentials, bigquery_client, GBQ_query).result()
+#         metadata = list(query_output)[0].metadata
+#         metadata = json.loads(metadata) if isinstance(metadata, str) else metadata
+#         model_2d["metadata"] = metadata
+#     GBQ_query = """
+#     MERGE `drywall_takeoff.models` t
+#     USING (
+#         SELECT
+#             @plan_id AS plan_id,
+#             @project_id AS project_id,
+#             @user_id AS user_id,
+#             @page_number AS page_number,
+#             @model_2d AS model_2d,
+#             @source AS source,
+#             @target_drywalls AS target_drywalls,
+#             @scale AS scale,
+#     ) s
+#     ON LOWER(t.project_id) = LOWER(s.project_id) AND LOWER(t.plan_id) = LOWER(s.plan_id) AND t.page_number = s.page_number
+#     WHEN MATCHED THEN
+#     UPDATE SET
+#         model_2d = s.model_2d,
+#         scale = COALESCE(NULLIF(s.scale, ''), t.scale),
+#         user_id = @user_id,
+#         updated_at = CURRENT_TIMESTAMP()
+#     WHEN NOT MATCHED THEN
+#     INSERT (
+#         plan_id,
+#         project_id,
+#         user_id,
+#         page_number,
+#         scale,
+#         model_2d,
+#         model_3d,
+#         takeoff,
+#         source,
+#         target_drywalls,
+#         created_at,
+#         updated_at
+#     )
+#     VALUES (
+#         s.plan_id,
+#         s.project_id,
+#         s.user_id,
+#         s.page_number,
+#         s.scale,
+#         s.model_2d,
+#         JSON '{}',
+#         JSON '{}',
+#         s.source,
+#         s.target_drywalls,
+#         CURRENT_TIMESTAMP(),
+#         CURRENT_TIMESTAMP()
+#     );
+#     """
+#     job_config = dict(
+#         query_parameters=[
+#             bigquery.ScalarQueryParameter("plan_id", "STRING", plan_id),
+#             bigquery.ScalarQueryParameter("project_id", "STRING", project_id),
+#             bigquery.ScalarQueryParameter("user_id", "STRING", user_id),
+#             bigquery.ScalarQueryParameter("page_number", "INT64", page_number),
+#             bigquery.ScalarQueryParameter("scale", "STRING", scale),
+#             bigquery.ScalarQueryParameter("model_2d", "JSON", model_2d),
+#             bigquery.ScalarQueryParameter("source", "STRING", GCS_URL_floorplan_page),
+#             bigquery.ScalarQueryParameter("target_drywalls", "STRING", GCS_URL_target_drywalls_page)
+#         ]
+#     )
+
+#     query_output = bigquery_run(credentials, bigquery_client, GBQ_query, job_config=job_config).result()
+#     return query_output
+
+async def insert_model_2d(
+    model_2d, scale, page_number, plan_id, user_id, project_id,
+    GCS_URL_floorplan_page, GCS_URL_target_drywalls_page,
+    pg_pool, credentials
+):
     if not model_2d.get("metadata", None):
-        GBQ_query = f"SELECT model_2d.metadata FROM `drywall_takeoff.models` WHERE LOWER(project_id) = LOWER('{project_id}') AND LOWER(plan_id) = LOWER('{plan_id}') AND page_number = {page_number};"
-        query_output = bigquery_run(credentials, bigquery_client, GBQ_query).result()
-        metadata = list(query_output)[0].metadata
-        metadata = json.loads(metadata) if isinstance(metadata, str) else metadata
-        model_2d["metadata"] = metadata
-    GBQ_query = """
-    MERGE `drywall_takeoff.models` t
-    USING (
-        SELECT
-            @plan_id AS plan_id,
-            @project_id AS project_id,
-            @user_id AS user_id,
-            @page_number AS page_number,
-            @model_2d AS model_2d,
-            @source AS source,
-            @target_drywalls AS target_drywalls,
-            @scale AS scale,
-    ) s
-    ON LOWER(t.project_id) = LOWER(s.project_id) AND LOWER(t.plan_id) = LOWER(s.plan_id) AND t.page_number = s.page_number
-    WHEN MATCHED THEN
-    UPDATE SET
-        model_2d = s.model_2d,
-        scale = COALESCE(NULLIF(s.scale, ''), t.scale),
-        user_id = @user_id,
-        updated_at = CURRENT_TIMESTAMP()
-    WHEN NOT MATCHED THEN
-    INSERT (
-        plan_id,
-        project_id,
-        user_id,
-        page_number,
-        scale,
-        model_2d,
-        model_3d,
-        takeoff,
-        source,
-        target_drywalls,
-        created_at,
-        updated_at
-    )
-    VALUES (
-        s.plan_id,
-        s.project_id,
-        s.user_id,
-        s.page_number,
-        s.scale,
-        s.model_2d,
-        JSON '{}',
-        JSON '{}',
-        s.source,
-        s.target_drywalls,
-        CURRENT_TIMESTAMP(),
-        CURRENT_TIMESTAMP()
-    );
-    """
-    job_config = dict(
-        query_parameters=[
-            bigquery.ScalarQueryParameter("plan_id", "STRING", plan_id),
-            bigquery.ScalarQueryParameter("project_id", "STRING", project_id),
-            bigquery.ScalarQueryParameter("user_id", "STRING", user_id),
-            bigquery.ScalarQueryParameter("page_number", "INT64", page_number),
-            bigquery.ScalarQueryParameter("scale", "STRING", scale),
-            bigquery.ScalarQueryParameter("model_2d", "JSON", model_2d),
-            bigquery.ScalarQueryParameter("source", "STRING", GCS_URL_floorplan_page),
-            bigquery.ScalarQueryParameter("target_drywalls", "STRING", GCS_URL_target_drywalls_page)
-        ]
+        row = await pg_pool.fetchrow(
+            """SELECT model_data->'metadata' AS metadata FROM models
+               WHERE LOWER(project_id) = LOWER($1)
+               AND LOWER(plan_id) = LOWER($2)
+               AND page_number = $3""",
+            project_id, plan_id, page_number
+        )
+        if row and row["metadata"]:
+            metadata = json.loads(row["metadata"]) if isinstance(row["metadata"], str) else row["metadata"]
+            model_2d["metadata"] = metadata
+
+    await pg_pool.execute(
+        """INSERT INTO models (plan_id, project_id, user_id, page_number, scale,
+               model_data, source, target_drywalls, created_at, updated_at)
+           VALUES ($1, $2, $3, $4, $5, $6::jsonb, $7, $8, now(), now())
+           ON CONFLICT (project_id, plan_id, page_number)
+           DO UPDATE SET
+               model_data = $6::jsonb,
+               scale = COALESCE(NULLIF($5, ''), models.scale),
+               user_id = $3,
+               updated_at = now()""",
+        plan_id, project_id, user_id, page_number, scale,
+        json.dumps(model_2d), GCS_URL_floorplan_page, GCS_URL_target_drywalls_page
     )
 
-    query_output = bigquery_run(credentials, bigquery_client, GBQ_query, job_config=job_config).result()
-    return query_output
 
-def is_duplicate(bigquery_client, credentials, pdf_path, project_id):
+async def is_duplicate(pg_pool, credentials, pdf_path, project_id):
     sha_256 = sha256(pdf_path)
-    GBQ_query = f"SELECT plan_id, sha256, status FROM `drywall_takeoff.plans` WHERE LOWER(project_id) = LOWER('{project_id}');"
-    query_output = bigquery_run(credentials, bigquery_client, GBQ_query).result()
-    for plan_target in list(query_output):
-        if not plan_target.sha256:
-            delete_plan(credentials, bigquery_client, plan_target.plan_id, project_id)
+    rows = await pg_pool.fetch(
+        "SELECT plan_id, sha256, status FROM plans WHERE LOWER(project_id) = LOWER($1)",
+        project_id
+    )
+    for plan_target in rows:
+        if not plan_target["sha256"]:
+            await delete_plan(credentials, pg_pool, plan_target["plan_id"], project_id)
             continue
-        if plan_target.sha256 == sha_256:
-            if plan_target.status == "FAILED":
-                delete_plan(credentials, bigquery_client, plan_target.plan_id, project_id)
+        if plan_target["sha256"] == sha_256:
+            if plan_target["status"] == "FAILED":
+                await delete_plan(credentials, pg_pool, plan_target["plan_id"], project_id)
                 return False
-            return plan_target.plan_id
+            return plan_target["plan_id"]
     return False
+# def is_duplicate(bigquery_client, credentials, pdf_path, project_id):
+#     sha_256 = sha256(pdf_path)
+#     GBQ_query = f"SELECT plan_id, sha256, status FROM `drywall_takeoff.plans` WHERE LOWER(project_id) = LOWER('{project_id}');"
+#     query_output = bigquery_run(credentials, bigquery_client, GBQ_query).result()
+#     for plan_target in list(query_output):
+#         if not plan_target.sha256:
+#             delete_plan(credentials, bigquery_client, plan_target.plan_id, project_id)
+#             continue
+#         if plan_target.sha256 == sha_256:
+#             if plan_target.status == "FAILED":
+#                 delete_plan(credentials, bigquery_client, plan_target.plan_id, project_id)
+#                 return False
+#             return plan_target.plan_id
+#     return False
 
-def delete_plan(credentials, bigquery_client, plan_id, project_id):
-    GBQ_query = f"DELETE FROM `drywall_takeoff.plans` WHERE LOWER(project_id) = LOWER('{project_id}') AND LOWER(plan_id) = LOWER('{plan_id}');"
-    query_output = bigquery_run(credentials, bigquery_client, GBQ_query).result()
-    return query_output
+# def delete_plan(credentials, bigquery_client, plan_id, project_id):
+#     GBQ_query = f"DELETE FROM `drywall_takeoff.plans` WHERE LOWER(project_id) = LOWER('{project_id}') AND LOWER(plan_id) = LOWER('{plan_id}');"
+#     query_output = bigquery_run(credentials, bigquery_client, GBQ_query).result()
+#     return query_output
+
+async def delete_plan(credentials, pg_pool, plan_id, project_id):
+    await pg_pool.execute(
+        "DELETE FROM plans WHERE LOWER(project_id) = LOWER($1) AND LOWER(plan_id) = LOWER($2)",
+        project_id, plan_id
+    )
 
 def load_floorplan_to_structured_2d_ID_token(credentials):
     auth_req = google.auth.transport.requests.Request()
