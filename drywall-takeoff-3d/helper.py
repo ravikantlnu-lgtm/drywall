@@ -83,89 +83,6 @@ def upload_floorplan(plan_path, user_id, plan_id, project_id, credentials, index
     blob.upload_from_filename(plan_path)
     return f"gs://{credentials["CloudStorage"]["bucket_name"]}/{blob_path}"
 
-# def insert_model_2d(
-#     model_2d,
-#     scale,
-#     page_number,
-#     plan_id,
-#     user_id,
-#     project_id,
-#     GCS_URL_floorplan_page,
-#     GCS_URL_target_drywalls_page,
-#     bigquery_client,
-#     credentials
-#     ):
-#     if not model_2d.get("metadata", None):
-#         GBQ_query = f"SELECT model_2d.metadata FROM `drywall_takeoff.models` WHERE LOWER(project_id) = LOWER('{project_id}') AND LOWER(plan_id) = LOWER('{plan_id}') AND page_number = {page_number};"
-#         query_output = bigquery_run(credentials, bigquery_client, GBQ_query).result()
-#         metadata = list(query_output)[0].metadata
-#         metadata = json.loads(metadata) if isinstance(metadata, str) else metadata
-#         model_2d["metadata"] = metadata
-#     GBQ_query = """
-#     MERGE `drywall_takeoff.models` t
-#     USING (
-#         SELECT
-#             @plan_id AS plan_id,
-#             @project_id AS project_id,
-#             @user_id AS user_id,
-#             @page_number AS page_number,
-#             @model_2d AS model_2d,
-#             @source AS source,
-#             @target_drywalls AS target_drywalls,
-#             @scale AS scale,
-#     ) s
-#     ON LOWER(t.project_id) = LOWER(s.project_id) AND LOWER(t.plan_id) = LOWER(s.plan_id) AND t.page_number = s.page_number
-#     WHEN MATCHED THEN
-#     UPDATE SET
-#         model_2d = s.model_2d,
-#         scale = COALESCE(NULLIF(s.scale, ''), t.scale),
-#         user_id = @user_id,
-#         updated_at = CURRENT_TIMESTAMP()
-#     WHEN NOT MATCHED THEN
-#     INSERT (
-#         plan_id,
-#         project_id,
-#         user_id,
-#         page_number,
-#         scale,
-#         model_2d,
-#         model_3d,
-#         takeoff,
-#         source,
-#         target_drywalls,
-#         created_at,
-#         updated_at
-#     )
-#     VALUES (
-#         s.plan_id,
-#         s.project_id,
-#         s.user_id,
-#         s.page_number,
-#         s.scale,
-#         s.model_2d,
-#         JSON '{}',
-#         JSON '{}',
-#         s.source,
-#         s.target_drywalls,
-#         CURRENT_TIMESTAMP(),
-#         CURRENT_TIMESTAMP()
-#     );
-#     """
-#     job_config = dict(
-#         query_parameters=[
-#             bigquery.ScalarQueryParameter("plan_id", "STRING", plan_id),
-#             bigquery.ScalarQueryParameter("project_id", "STRING", project_id),
-#             bigquery.ScalarQueryParameter("user_id", "STRING", user_id),
-#             bigquery.ScalarQueryParameter("page_number", "INT64", page_number),
-#             bigquery.ScalarQueryParameter("scale", "STRING", scale),
-#             bigquery.ScalarQueryParameter("model_2d", "JSON", model_2d),
-#             bigquery.ScalarQueryParameter("source", "STRING", GCS_URL_floorplan_page),
-#             bigquery.ScalarQueryParameter("target_drywalls", "STRING", GCS_URL_target_drywalls_page)
-#         ]
-#     )
-
-#     query_output = bigquery_run(credentials, bigquery_client, GBQ_query, job_config=job_config).result()
-#     return query_output
 
 async def insert_model_2d(
     model_2d, scale, page_number, plan_id, user_id, project_id,
@@ -174,7 +91,7 @@ async def insert_model_2d(
 ):
     if not model_2d.get("metadata", None):
         row = await pg_pool.fetchrow(
-            """SELECT model_data->'metadata' AS metadata FROM models
+            """SELECT model_2d->'metadata' AS metadata FROM models
                WHERE LOWER(project_id) = LOWER($1)
                AND LOWER(plan_id) = LOWER($2)
                AND page_number = $3""",
@@ -186,11 +103,11 @@ async def insert_model_2d(
 
     await pg_pool.execute(
         """INSERT INTO models (plan_id, project_id, user_id, page_number, scale,
-               model_data, source, target_drywalls, created_at, updated_at)
+               model_2d, model_3d, takeoff, source, target_drywalls, created_at, updated_at)
            VALUES ($1, $2, $3, $4, $5, $6::jsonb, $7, $8, now(), now())
            ON CONFLICT (project_id, plan_id, page_number)
            DO UPDATE SET
-               model_data = $6::jsonb,
+               model_2d = $6::jsonb,
                scale = COALESCE(NULLIF($5, ''), models.scale),
                user_id = $3,
                updated_at = now()""",
