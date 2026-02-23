@@ -104,7 +104,7 @@ async def insert_model_2d(
     await pg_pool.execute(
         """INSERT INTO models (plan_id, project_id, user_id, page_number, scale,
                model_2d, model_3d, takeoff, source, target_drywalls, created_at, updated_at)
-           VALUES ($1, $2, $3, $4, $5, $6::jsonb, $7, $8, now(), now())
+           VALUES ($1, $2, $3, $4, $5, $6::jsonb, '{}'::jsonb, '{}'::jsonb, $7, $8, now(), now())
            ON CONFLICT (project_id, plan_id, page_number)
            DO UPDATE SET
                model_2d = $6::jsonb,
