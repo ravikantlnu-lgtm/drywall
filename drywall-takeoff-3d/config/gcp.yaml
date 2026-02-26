@@ -53,7 +53,7 @@ CloudRun:
         - https://prj-fbm-drywall-dev.web.app
     APIs:
         wall_detector: https://wall-detector-460679066182.us-central1.run.app
-        floorplan_to_structured_2d: https://floorplan-to-structured-2d-fbm-460679066182.us-central1.run.app
+        floorplan_to_structured_2d: https://floorplan-to-structured-2d-pg-460679066182.us-central1.run.app
 PostgreSQL:
     host: 10.132.0.3
     port: 5432
