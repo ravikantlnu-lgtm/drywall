@@ -55,8 +55,8 @@ CloudRun:
         wall_detector: https://wall-detector-460679066182.us-central1.run.app
         floorplan_to_structured_2d: https://floorplan-to-structured-2d-fbm-460679066182.us-central1.run.app
 PostgreSQL:
-    host: localhost      # 34.41.24.175              # Your Cloud SQL private IP from GenAI-Project
+    host: 10.132.0.3
     port: 5432
     database: drywall_takeoff
     user: postgres
-    password: Drywall@2026 
+    password: Drywall@2026
