@@ -285,7 +285,12 @@ pg_pool = None
 @app.on_event("startup")
 async def startup():
     global pg_pool
-    pg_pool = await get_pg_pool(CREDENTIALS)
+    try:
+        pg_pool = await get_pg_pool(CREDENTIALS)
+        logging.info("SYSTEM: PostgreSQL connection pool created successfully")
+    except Exception as e:
+        logging.warning(f"SYSTEM: PostgreSQL connection failed: {e}. Running without database.")
+        pg_pool = None
 
 @app.on_event("shutdown")
 async def shutdown():
