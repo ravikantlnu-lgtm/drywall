@@ -1,47 +1,343 @@
-import json
+"""
+helper.py — floorplan-to-structured-2d-fbm (drywall_bq repo)
+Migrated from BigQuery to PostgreSQL.
+"""
+
 import logging
+import json
+import sys
+import os
+import time
+import math
 import hashlib
+import asyncio
 from pathlib import Path
+from contextlib import asynccontextmanager
+
+import asyncpg
 import cv2
 from time import sleep
 from random import uniform
-import math
+from ruamel.yaml import YAML
 
-import geoip2.database as geoip2_database
-from google.cloud import bigquery
 from google.cloud.storage import Client as CloudStorageClient
-import google.auth.transport.requests
-from google.oauth2.service_account import IDTokenCredentials
 import vertexai
 from vertexai.generative_models import GenerativeModel, Part, Content
 from google.api_core.exceptions import ResourceExhausted, ServiceUnavailable, DeadlineExceeded
+from fastapi.encoders import jsonable_encoder
 
-from prompt import ARCHITECTURAL_DRAWING_CLASSIFIER, ArchitecturalDrawingClassifierResponse
+from transcriber import Transcriber
 
 
-def load_bigquery_client(credentials):
-    bigquery_client = bigquery.Client.from_service_account_json(credentials["GBQServer"]["service_account_key"])
-    return bigquery_client
+# ---------------------------------------------------------------------------
+# Structured Logging
+# ---------------------------------------------------------------------------
 
-def bigquery_run(credentials, bigquery_client, GBQ_query, job_config=dict()):
-    job_config = bigquery.QueryJobConfig(
-        destination_encryption_configuration=bigquery.EncryptionConfiguration(
-            kms_key_name=credentials["GBQServer"]["KMS_key"]
-        ),
-        **job_config
+def log_json(severity: str, message: str, **kwargs):
+    """Emit a single structured JSON log line to stdout (Cloud Logging compatible)."""
+    payload = {"severity": severity, "message": message}
+    payload.update(kwargs)
+    print(json.dumps(payload, default=str), flush=True)
+
+
+@asynccontextmanager
+async def timed_step(step_name: str, request_id: str = "", volume_context: dict = None, **extra):
+    """Async context manager that logs step duration on exit, with optional volume metrics."""
+    start = time.perf_counter()
+    log_payload = {"step": step_name, "request_id": request_id}
+    if volume_context:
+        log_payload["volume_context"] = volume_context
+    log_payload.update(extra)
+    log_json("INFO", "STEP_START", **log_payload)
+    error_msg = None
+    try:
+        yield
+    except Exception as exc:
+        error_msg = f"{type(exc).__name__}: {exc}"
+        raise
+    finally:
+        duration_ms = round((time.perf_counter() - start) * 1000, 2)
+        log_payload["duration_ms"] = duration_ms
+        if error_msg:
+            log_payload["error"] = error_msg
+            log_json("ERROR", "STEP_FAILED", **log_payload)
+        else:
+            log_json("INFO", "STEP_COMPLETE", **log_payload)
+
+
+# ---------------------------------------------------------------------------
+# Configuration Loaders
+# ---------------------------------------------------------------------------
+
+def load_gcp_credentials() -> dict:
+    yaml = YAML(typ="safe", pure=True)
+    with open("gcp.yaml", 'r') as f:
+        credentials = yaml.load(f)
+    os.environ['GOOGLE_APPLICATION_CREDENTIALS'] = credentials["service_drywall_account_key"]
+    return credentials
+
+
+def load_hyperparameters() -> dict:
+    yaml = YAML(typ="safe", pure=True)
+    with open("hyperparameters.yaml", 'r') as f:
+        hyperparameters = yaml.load(f)
+    return hyperparameters
+
+
+def enable_logging_on_stdout():
+    logging.basicConfig(
+        level=logging.INFO,
+        format='{"severity": "%(levelname)s", "message": "%(message)s"}',
+        handlers=[logging.StreamHandler(sys.stdout)],
+        force=True
     )
-    query_output = bigquery_client.query(GBQ_query, job_config=job_config)
-    return query_output
 
-def sha256(path, chunk_size=8192):
-    sha256 = hashlib.sha256()
-    with open(path, "rb") as f:
-        for chunk in iter(lambda: f.read(chunk_size), b""):
-            sha256.update(chunk)
-    return sha256.hexdigest()
+
+# ---------------------------------------------------------------------------
+# GCS Client (shared singleton)
+# ---------------------------------------------------------------------------
+
+_gcs_client = None
+
+def get_gcs_client() -> CloudStorageClient:
+    """Return a shared GCS client. Created once on first call."""
+    global _gcs_client
+    if _gcs_client is None:
+        _gcs_client = CloudStorageClient()
+        log_json("INFO", "GCS_CLIENT_CREATED")
+    return _gcs_client
+
+
+# ---------------------------------------------------------------------------
+# PostgreSQL Connection Pool
+# ---------------------------------------------------------------------------
+
+async def create_pg_pool(credentials) -> asyncpg.Pool:
+    """Create and return an asyncpg connection pool."""
+    pg_config = credentials["PostgreSQL"]
+    try:
+        pool = await asyncpg.create_pool(
+            host=pg_config["host"],
+            port=pg_config["port"],
+            database=pg_config["database"],
+            user=pg_config["user"],
+            password=pg_config["password"],
+            min_size=pg_config.get("min_pool_size", 2),
+            max_size=pg_config.get("max_pool_size", 10),
+            command_timeout=60,
+        )
+        log_json("INFO", "PG_POOL_CREATED", host=pg_config["host"],
+                 database=pg_config["database"],
+                 min_size=pg_config.get("min_pool_size", 2),
+                 max_size=pg_config.get("max_pool_size", 10))
+        return pool
+    except Exception as exc:
+        log_json("ERROR", "PG_POOL_FAILED", host=pg_config["host"],
+                 error=f"{type(exc).__name__}: {exc}")
+        return None
+
+
+# ---------------------------------------------------------------------------
+# Core DB Helpers
+# ---------------------------------------------------------------------------
+
+async def pg_fetch_all(pool: asyncpg.Pool, query: str, params: list = None,
+                       query_name: str = "unnamed") -> list:
+    """Execute a SELECT and return all rows."""
+    start = time.perf_counter()
+    try:
+        async with pool.acquire() as conn:
+            rows = await conn.fetch(query, *(params or []))
+        duration_ms = round((time.perf_counter() - start) * 1000, 2)
+        log_json("INFO", "DB_FETCH_ALL", query=query_name,
+                 duration_ms=duration_ms, row_count=len(rows))
+        return rows
+    except Exception as exc:
+        duration_ms = round((time.perf_counter() - start) * 1000, 2)
+        log_json("ERROR", "DB_FETCH_ALL_FAILED", query=query_name,
+                 duration_ms=duration_ms, error=f"{type(exc).__name__}: {exc}")
+        raise
+
+
+async def pg_fetch_one(pool: asyncpg.Pool, query: str, params: list = None,
+                       query_name: str = "unnamed"):
+    """Execute a SELECT and return first row (or None)."""
+    start = time.perf_counter()
+    try:
+        async with pool.acquire() as conn:
+            row = await conn.fetchrow(query, *(params or []))
+        duration_ms = round((time.perf_counter() - start) * 1000, 2)
+        log_json("INFO", "DB_FETCH_ONE", query=query_name,
+                 duration_ms=duration_ms, found=row is not None)
+        return row
+    except Exception as exc:
+        duration_ms = round((time.perf_counter() - start) * 1000, 2)
+        log_json("ERROR", "DB_FETCH_ONE_FAILED", query=query_name,
+                 duration_ms=duration_ms, error=f"{type(exc).__name__}: {exc}")
+        raise
+
+
+async def pg_execute(pool: asyncpg.Pool, query: str, params: list = None,
+                     query_name: str = "unnamed") -> str:
+    """Execute an INSERT/UPDATE/DELETE and return status string."""
+    start = time.perf_counter()
+    try:
+        async with pool.acquire() as conn:
+            status = await conn.execute(query, *(params or []))
+        duration_ms = round((time.perf_counter() - start) * 1000, 2)
+        log_json("INFO", "DB_EXECUTE", query=query_name,
+                 duration_ms=duration_ms, status=status)
+        return status
+    except Exception as exc:
+        duration_ms = round((time.perf_counter() - start) * 1000, 2)
+        log_json("ERROR", "DB_EXECUTE_FAILED", query=query_name,
+                 duration_ms=duration_ms, error=f"{type(exc).__name__}: {exc}")
+        raise
+
+
+# ---------------------------------------------------------------------------
+# JSONB Helper
+# ---------------------------------------------------------------------------
+
+def parse_jsonb(value):
+    """Safely parse a JSONB value from asyncpg (could be str, dict, or None)."""
+    if value is None:
+        return None
+    if isinstance(value, str):
+        try:
+            return json.loads(value)
+        except (json.JSONDecodeError, TypeError):
+            return None
+    return value
+
+
+# ---------------------------------------------------------------------------
+# Database Operations (migrated from BigQuery)
+# ---------------------------------------------------------------------------
+
+async def insert_model_2d(
+    model_2d,
+    scale,
+    page_number,
+    page_section_number,
+    plan_id,
+    user_id,
+    project_id,
+    target_drywalls,
+    pool,
+    credentials,
+):
+    """Upsert a 2D model into the models table.
+    BQ MERGE → PG INSERT ... ON CONFLICT.
+    Uses fresh asyncpg.connect (not pool) because after 5-15 min of
+    Vertex AI processing, pool connections are killed by VPC connector.
+    """
+    page_number = int(page_number)
+    scale = scale or ''
+    target_drywalls = target_drywalls or ''
+    if not page_section_number:
+        page_section_number = 'I'
+
+    pg_config = credentials["PostgreSQL"]
+    conn = None
+    for attempt in range(3):
+        try:
+            conn = await asyncpg.connect(
+                host=pg_config["host"],
+                port=pg_config["port"],
+                database=pg_config["database"],
+                user=pg_config["user"],
+                password=pg_config["password"],
+                timeout=60,
+                command_timeout=60,
+            )
+            log_json("INFO", "DB_DIRECT_CONNECT_SUCCESS", attempt=attempt + 1)
+            break
+        except Exception as e:
+            log_json("WARNING", "DB_DIRECT_CONNECT_RETRY", attempt=attempt + 1,
+                     error=f"{type(e).__name__}: {e}")
+            if attempt == 2:
+                raise
+            await asyncio.sleep(2)
+    try:
+        if not model_2d.get("metadata", None):
+            row = await conn.fetchrow(
+                "SELECT model_2d->'metadata' AS metadata FROM models "
+                "WHERE LOWER(project_id) = LOWER($1) AND LOWER(plan_id) = LOWER($2) AND page_number = $3",
+                project_id, plan_id, page_number,
+            )
+            if row:
+                metadata = parse_jsonb(row["metadata"])
+                if metadata:
+                    model_2d["metadata"] = metadata
+
+        model_2d_json = json.dumps(model_2d)
+
+        status = await conn.execute(
+            """
+            INSERT INTO models (
+                plan_id, project_id, user_id, page_number, scale,
+                model_2d, model_3d, takeoff, target_drywalls,
+                created_at, updated_at
+            ) VALUES (
+                $1, $2, $3, $4, $5,
+                $6::jsonb, '{}'::jsonb, '{}'::jsonb, $7,
+                NOW(), NOW()
+            )
+            ON CONFLICT (LOWER(project_id), LOWER(plan_id), page_number)
+            DO UPDATE SET
+                model_2d = EXCLUDED.model_2d,
+                scale = CASE WHEN EXCLUDED.scale = '' THEN models.scale ELSE EXCLUDED.scale END,
+                user_id = EXCLUDED.user_id,
+                updated_at = NOW()
+            """,
+            plan_id, project_id, user_id, page_number, scale,
+            model_2d_json, target_drywalls,
+        )
+        log_json("INFO", "DB_EXECUTE", query="insert_model_2d", status=status)
+    finally:
+        await conn.close()
+
+
+async def load_templates(pool, credentials):
+    """Load SKU/drywall templates from the sku table."""
+    rows = await pg_fetch_all(pool, "SELECT * FROM sku", query_name="load_templates")
+    product_templates_target = []
+    cached_templates_sku = []
+    for row in rows:
+        product_template = dict(row)
+        if product_template["sku_id"] in cached_templates_sku:
+            continue
+        cached_templates_sku.append(product_template["sku_id"])
+        product_template["sku_variant"] = f"{product_template['sku_id']} - {product_template['sku_description']}"
+        product_template["color_code"] = [
+            product_template["color_code"]['b'],
+            product_template["color_code"]['g'],
+            product_template["color_code"]['r']
+        ]
+        product_templates_target.append(product_template)
+    log_json("INFO", "TEMPLATES_LOADED", template_count=len(product_templates_target))
+    return jsonable_encoder(product_templates_target)
+
+
+# ---------------------------------------------------------------------------
+# Non-DB Helpers (unchanged)
+# ---------------------------------------------------------------------------
+
+def download_floorplan(user_id, plan_id, project_id, credentials, index, destination_path="/tmp/floor_plan_wall_processed.png"):
+    client = get_gcs_client()
+    bucket = client.bucket(credentials["CloudStorage"]["bucket_name"])
+    blob_path = f"{project_id.lower()}/{plan_id.lower()}/{index}/floor_plan.png"
+    blob = bucket.blob(blob_path)
+    destination_path = Path(destination_path)
+    destination_path = destination_path.parent.joinpath(project_id).joinpath(plan_id).joinpath(user_id).joinpath(destination_path.name)
+    destination_path.parent.mkdir(parents=True, exist_ok=True)
+    blob.download_to_filename(destination_path)
+    return destination_path
+
 
 def upload_floorplan(plan_path, plan_id, project_id, credentials, index=None, directory=None):
-    client = CloudStorageClient()
+    client = get_gcs_client()
     page_number = Path(plan_path.stem).suffix
     if page_number:
         blob_object_name = Path(str(plan_path).replace(page_number, '')).name
@@ -59,196 +355,26 @@ def upload_floorplan(plan_path, plan_id, project_id, credentials, index=None, di
         else:
             blob_path = f"{project_id.lower()}/{plan_id.lower()}/{blob_object_name}"
     blob = bucket.blob(blob_path)
-
     blob.upload_from_filename(plan_path)
-    return f"gs://{credentials["CloudStorage"]["bucket_name"]}/{blob_path}"
+    return f"gs://{credentials['CloudStorage']['bucket_name']}/{blob_path}"
 
-def insert_model_2d(
-    model_2d,
-    scale,
-    page_number,
-    plan_id,
-    user_id,
-    project_id,
-    GCS_URL_floorplan_page,
-    GCS_URL_target_drywalls_page,
-    bigquery_client,
-    credentials,
-    page_section_number=None,
-    ):
-    if not page_section_number:
-        page_section_number = 'I'
-    if not model_2d.get("metadata", None):
-        GBQ_query = f"SELECT model_2d.metadata FROM `drywall_takeoff.models` WHERE LOWER(project_id) = LOWER('{project_id}') AND LOWER(plan_id) = LOWER('{plan_id}') AND page_number = {page_number} AND page_section_number = '{page_section_number}';"
-        query_output = bigquery_run(credentials, bigquery_client, GBQ_query).result()
-        metadata = list(query_output)[0].metadata
-        metadata = json.loads(metadata) if isinstance(metadata, str) else metadata
-        model_2d["metadata"] = metadata
-    GBQ_query = """
-    MERGE `drywall_takeoff.models` t
-    USING (
-        SELECT
-            @plan_id AS plan_id,
-            @project_id AS project_id,
-            @user_id AS user_id,
-            @page_number AS page_number,
-            @page_section_number AS page_section_number,
-            @model_2d AS model_2d,
-            @source AS source,
-            @target_drywalls AS target_drywalls,
-            @scale AS scale,
-    ) s
-    ON LOWER(t.project_id) = LOWER(s.project_id) AND LOWER(t.plan_id) = LOWER(s.plan_id) AND t.page_number = s.page_number AND t.page_section_number = s.page_section_number
-    WHEN MATCHED THEN
-    UPDATE SET
-        model_2d = s.model_2d,
-        scale = COALESCE(NULLIF(s.scale, ''), t.scale),
-        user_id = @user_id,
-        updated_at = CURRENT_TIMESTAMP()
-    WHEN NOT MATCHED THEN
-    INSERT (
-        plan_id,
-        project_id,
-        user_id,
-        page_number,
-        page_section_number,
-        scale,
-        model_2d,
-        model_3d,
-        takeoff,
-        source,
-        target_drywalls,
-        created_at,
-        updated_at
-    )
-    VALUES (
-        s.plan_id,
-        s.project_id,
-        s.user_id,
-        s.page_number,
-        s.page_section_number,
-        s.scale,
-        s.model_2d,
-        JSON '{}',
-        JSON '{}',
-        s.source,
-        s.target_drywalls,
-        CURRENT_TIMESTAMP(),
-        CURRENT_TIMESTAMP()
-    );
-    """
-    job_config = dict(
-        query_parameters=[
-            bigquery.ScalarQueryParameter("plan_id", "STRING", plan_id),
-            bigquery.ScalarQueryParameter("project_id", "STRING", project_id),
-            bigquery.ScalarQueryParameter("user_id", "STRING", user_id),
-            bigquery.ScalarQueryParameter("page_number", "INT64", page_number),
-            bigquery.ScalarQueryParameter("page_section_number", "STRING", page_section_number),
-            bigquery.ScalarQueryParameter("scale", "STRING", scale),
-            bigquery.ScalarQueryParameter("model_2d", "JSON", model_2d),
-            bigquery.ScalarQueryParameter("source", "STRING", GCS_URL_floorplan_page),
-            bigquery.ScalarQueryParameter("target_drywalls", "STRING", GCS_URL_target_drywalls_page)
-        ]
-    )
 
-    query_output = bigquery_run(credentials, bigquery_client, GBQ_query, job_config=job_config).result()
-    return query_output
-
-def is_duplicate(bigquery_client, credentials, pdf_path, project_id):
-    sha_256 = sha256(pdf_path)
-    GBQ_query = f"SELECT plan_id, sha256, status FROM `drywall_takeoff.plans` WHERE LOWER(project_id) = LOWER('{project_id}');"
-    query_output = bigquery_run(credentials, bigquery_client, GBQ_query).result()
-    for plan_target in list(query_output):
-        if plan_target.sha256 == sha_256:
-            if plan_target.status == "FAILED":
-                delete_plan(credentials, bigquery_client, plan_target.plan_id, project_id)
-                return False
-            return plan_target.plan_id
-    return False
-
-def delete_plan(credentials, bigquery_client, plan_id, project_id):
-    GBQ_query = f"DELETE FROM `drywall_takeoff.plans` WHERE LOWER(project_id) = LOWER('{project_id}') AND LOWER(plan_id) = LOWER('{plan_id}');"
-    query_output = bigquery_run(credentials, bigquery_client, GBQ_query).result()
-    return query_output
-
-def load_floorplan_to_structured_2d_ID_token(credentials):
-    auth_req = google.auth.transport.requests.Request()
-    service_account_credentials = IDTokenCredentials.from_service_account_file(
-        credentials["service_drywall_account_key"],
-        target_audience=credentials["CloudRun"]["APIs"]["floorplan_to_structured_2d"]
-    )
-    service_account_credentials.refresh(auth_req)
-    id_token = service_account_credentials.token
-    return id_token
-
-def load_vertex_ai_client(credentials, request, default_region="us-central1"):
+def load_vertex_ai_client(credentials, region="us-central1"):
     with open(credentials["VertexAI"]["service_account_key"], 'r') as f:
         project_id = json.load(f)["project_id"]
-    region = load_nearest_region(
-        request,
-        credentials["geolite_database"],
-        credentials["VertexAI"]["llm"]["available_regions"],
-        default_region=default_region
-    )
     vertexai.init(project=project_id, location=region)
     vertex_ai_client = GenerativeModel(credentials["VertexAI"]["llm"]["model_name"])
     generation_config = credentials["VertexAI"]["llm"]["parameters"]
     return vertex_ai_client, generation_config
 
-def load_nearest_region(request, geolite_database, available_regions, default_region="us-central1"):
-    def _compute_haversine_distance(latitude_1, longitude_1, latitude_2, longitude_2):
-        R = 6371
-        d_latitude = math.radians(latitude_2-latitude_1)
-        d_longitude = math.radians(longitude_2-longitude_1)
-        a = math.sin(d_latitude/2)**2 + math.cos(math.radians(latitude_1)) * math.cos(math.radians(latitude_2)) * math.sin(d_longitude/2)**2
-        return 2*R*math.asin(math.sqrt(a))
 
-    ip_address = request.headers.get("X-Client-IP", (request.client.host if request.client else None))
-    if not ip_address or "," not in ip_address:
-        return default_region
-    if ip_address and "," in ip_address:
-        ip_address = ip_address.split(",")[0].strip()
-    geoip2_reader = geoip2_database.Reader(geolite_database)
-    try:
-        response = geoip2_reader.city(ip_address)
-        (response.location.latitude, response.location.longitude, response.country.iso_code)
-        nearest_region = None
-        minimum_distance = float("inf")
-        for region, (latitude, longitude) in available_regions.items():
-            distance = _compute_haversine_distance(response.location.latitude, response.location.longitude, latitude, longitude)
-            if distance < minimum_distance:
-                minimum_distance = distance
-                nearest_region = region
-        return nearest_region
-    except Exception:
-        return default_region
+def transcribe(credentials, hyperparameters, floor_plan_path):
+    transcriber = Transcriber(credentials, hyperparameters)
+    return transcriber.transcribe(floor_plan_path, [0, 1, -1, -2])
 
-def classify_plan(plan_path, vertex_ai_client_parameters):
-    vertex_ai_client, vertex_ai_generation_config, vertex_ai_max_retry = vertex_ai_client_parameters
-    plan_BGR = cv2.imread(plan_path)
-    _, canvas_buffer_array = cv2.imencode(".png", plan_BGR)
-    bytes_canvas = canvas_buffer_array.tobytes()
-    system = Content(role="model", parts=[Part.from_text(ARCHITECTURAL_DRAWING_CLASSIFIER)])
-    query = Content(role="user", parts=[
-        Part.from_data(data=bytes_canvas, mime_type="image/png")
-    ])
-    contents = [system, query]
-    try:
-        _, plan_type = phoenix_call(
-            lambda temperature: vertex_ai_client.generate_content(
-            contents=contents,
-            generation_config={**vertex_ai_generation_config, "temperature": temperature},
-            ),
-                max_retry=vertex_ai_max_retry,
-                pydantic_model=ArchitecturalDrawingClassifierResponse,
-        )
-    except Exception as e:
-        logging.warning(f"SYSTEM: Plan Classification has failed")
-        plan_type = dict(plan_type="FLOOR_PLAN")
-
-    return plan_type
 
 def phoenix_call(generate_content_lambda, max_retry=5, base_delay=1.0, pydantic_model=None):
+    """Call Vertex AI with retry logic and optional Pydantic validation."""
     n_iterations = 0
     temperature = 0
     while n_iterations < max_retry:
@@ -265,33 +391,37 @@ def phoenix_call(generate_content_lambda, max_retry=5, base_delay=1.0, pydantic_
                 raise e
             sleep_time = base_delay * (2 ** (n_iterations - 1)) + uniform(0, 0.5)
             sleep(sleep_time)
-            logging.warning(f"SYSTEM: {e}: RETRYING ...")
+            log_json("WARNING", "PHOENIX_CALL_RETRY",
+                     attempt=n_iterations, max_retry=max_retry,
+                     reason="rate_limit_or_unavailable", error=str(e))
         except Exception as e:
             n_iterations += 1
             if n_iterations >= max_retry:
                 raise e
             temperature = min(0.5 * (n_iterations + 1) / max_retry, 0.5)
-            logging.warning(f"SYSTEM: Response Generation/Parsing failed with ERROR: {e}")
-            logging.warning(f"SYSTEM: RETRYING with TEMPERATURE: {temperature}")
+            log_json("WARNING", "PHOENIX_CALL_RETRY",
+                     attempt=n_iterations, max_retry=max_retry,
+                     reason="parse_or_generation_error", error=str(e))
 
-def load_templates(bigquery_client, credentials):
-    GBQ_query = f"SELECT * FROM `{credentials["GBQServer"]["table_name_sku"]}`"
-    product_templates = list(bigquery_run(credentials, bigquery_client, GBQ_query).result())
 
-    logging.info("SYSTEM: Product Templates retrieved successfully")
-    product_templates_target = list()
-    cached_templates_sku = list()
-    for product_template in product_templates:
-        product_template = dict(product_template)
-        if product_template["sku_id"] in cached_templates_sku:
-            continue
-        cached_templates_sku.append(product_template["sku_id"])
-        product_template["sku_variant"] = f"{product_template["sku_id"]} - {product_template["sku_description"]}"
-        product_template["color_code"] = [product_template["color_code"]['b'], product_template["color_code"]['g'], product_template["color_code"]['r']]
-        product_templates_target.append(product_template)
-    return product_templates_target
+def load_section_from_page(wall_segmented_path, floor_plan_path, bounding_box_offset, section_name):
+    """Extract a section from a page using bounding box offset."""
+    offset_top_left = bounding_box_offset.get("offset_top_left", (0, 0))
+    offset_bottom_right = bounding_box_offset.get("offset_bottom_right", (1, 1))
 
-def query_drywall(query_sku_variant, drywall_templates):
-    for drywall_template in drywall_templates:
-        if drywall_template["sku_variant"] == query_sku_variant:
-            return drywall_template
+    floor_plan = cv2.imread(str(floor_plan_path))
+    wall_segmented = cv2.imread(str(wall_segmented_path))
+
+    if floor_plan is None or wall_segmented is None:
+        return wall_segmented_path
+
+    height, width = floor_plan.shape[:2]
+    x1 = int(offset_top_left[0] * width)
+    y1 = int(offset_top_left[1] * height)
+    x2 = int(offset_bottom_right[0] * width)
+    y2 = int(offset_bottom_right[1] * height)
+
+    wall_segmented_section = wall_segmented[y1:y2, x1:x2]
+    output_path = Path(str(wall_segmented_path)).parent / f"wall_segmented_{section_name}.png"
+    cv2.imwrite(str(output_path), wall_segmented_section)
+    return output_path
