@@ -1,16 +1,15 @@
 """
-helper.py — floorplan-to-structured-2d-fbm (drywall_bq repo)
+helper.py — drywall-takeoff-3d-fbm (drywall_bq repo)
 Migrated from BigQuery to PostgreSQL.
 """
 
-import logging
 import json
+import hashlib
 import sys
 import os
 import time
-import math
-import hashlib
-import asyncio
+import re
+import logging
 from pathlib import Path
 from contextlib import asynccontextmanager
 
@@ -21,12 +20,13 @@ from random import uniform
 from ruamel.yaml import YAML
 
 from google.cloud.storage import Client as CloudStorageClient
+import google.auth.transport.requests
+from google.oauth2.service_account import IDTokenCredentials
 import vertexai
 from vertexai.generative_models import GenerativeModel, Part, Content
 from google.api_core.exceptions import ResourceExhausted, ServiceUnavailable, DeadlineExceeded
-from fastapi.encoders import jsonable_encoder
 
-from transcriber import Transcriber
+from prompt import ARCHITECTURAL_DRAWING_CLASSIFIER, ArchitecturalDrawingClassifierResponse
 
 
 # ---------------------------------------------------------------------------
@@ -143,7 +143,6 @@ async def create_pg_pool(credentials) -> asyncpg.Pool:
 
 async def pg_fetch_all(pool: asyncpg.Pool, query: str, params: list = None,
                        query_name: str = "unnamed") -> list:
-    """Execute a SELECT and return all rows."""
     start = time.perf_counter()
     try:
         async with pool.acquire() as conn:
@@ -161,7 +160,6 @@ async def pg_fetch_all(pool: asyncpg.Pool, query: str, params: list = None,
 
 async def pg_fetch_one(pool: asyncpg.Pool, query: str, params: list = None,
                        query_name: str = "unnamed"):
-    """Execute a SELECT and return first row (or None)."""
     start = time.perf_counter()
     try:
         async with pool.acquire() as conn:
@@ -179,7 +177,6 @@ async def pg_fetch_one(pool: asyncpg.Pool, query: str, params: list = None,
 
 async def pg_execute(pool: asyncpg.Pool, query: str, params: list = None,
                      query_name: str = "unnamed") -> str:
-    """Execute an INSERT/UPDATE/DELETE and return status string."""
     start = time.perf_counter()
     try:
         async with pool.acquire() as conn:
@@ -200,7 +197,6 @@ async def pg_execute(pool: asyncpg.Pool, query: str, params: list = None,
 # ---------------------------------------------------------------------------
 
 def parse_jsonb(value):
-    """Safely parse a JSONB value from asyncpg (could be str, dict, or None)."""
     if value is None:
         return None
     if isinstance(value, str):
@@ -216,91 +212,86 @@ def parse_jsonb(value):
 # ---------------------------------------------------------------------------
 
 async def insert_model_2d(
-    model_2d,
-    scale,
-    page_number,
-    page_section_number,
-    plan_id,
-    user_id,
-    project_id,
-    target_drywalls,
-    pool,
-    credentials,
+    model_2d, scale, page_number, plan_id, user_id, project_id,
+    GCS_URL_floorplan_page, GCS_URL_target_drywalls_page, pool, credentials
 ):
-    """Upsert a 2D model into the models table.
-    BQ MERGE → PG INSERT ... ON CONFLICT.
-    Uses fresh asyncpg.connect (not pool) because after 5-15 min of
-    Vertex AI processing, pool connections are killed by VPC connector.
-    """
+    """Upsert a 2D model. BQ MERGE → PG INSERT ... ON CONFLICT."""
     page_number = int(page_number)
+    source = GCS_URL_floorplan_page or ''
+    target_drywalls = GCS_URL_target_drywalls_page or ''
     scale = scale or ''
-    target_drywalls = target_drywalls or ''
-    if not page_section_number:
-        page_section_number = 'I'
 
-    pg_config = credentials["PostgreSQL"]
-    conn = None
-    for attempt in range(3):
-        try:
-            conn = await asyncpg.connect(
-                host=pg_config["host"],
-                port=pg_config["port"],
-                database=pg_config["database"],
-                user=pg_config["user"],
-                password=pg_config["password"],
-                timeout=60,
-                command_timeout=60,
-            )
-            log_json("INFO", "DB_DIRECT_CONNECT_SUCCESS", attempt=attempt + 1)
-            break
-        except Exception as e:
-            log_json("WARNING", "DB_DIRECT_CONNECT_RETRY", attempt=attempt + 1,
-                     error=f"{type(e).__name__}: {e}")
-            if attempt == 2:
-                raise
-            await asyncio.sleep(2)
-    try:
-        if not model_2d.get("metadata", None):
-            row = await conn.fetchrow(
-                "SELECT model_2d->'metadata' AS metadata FROM models "
-                "WHERE LOWER(project_id) = LOWER($1) AND LOWER(plan_id) = LOWER($2) AND page_number = $3",
-                project_id, plan_id, page_number,
-            )
-            if row:
-                metadata = parse_jsonb(row["metadata"])
-                if metadata:
-                    model_2d["metadata"] = metadata
-
-        model_2d_json = json.dumps(model_2d)
-
-        status = await conn.execute(
-            """
-            INSERT INTO models (
-                plan_id, project_id, user_id, page_number, scale,
-                model_2d, model_3d, takeoff, target_drywalls,
-                created_at, updated_at
-            ) VALUES (
-                $1, $2, $3, $4, $5,
-                $6::jsonb, '{}'::jsonb, '{}'::jsonb, $7,
-                NOW(), NOW()
-            )
-            ON CONFLICT (LOWER(project_id), LOWER(plan_id), page_number)
-            DO UPDATE SET
-                model_2d = EXCLUDED.model_2d,
-                scale = CASE WHEN EXCLUDED.scale = '' THEN models.scale ELSE EXCLUDED.scale END,
-                user_id = EXCLUDED.user_id,
-                updated_at = NOW()
-            """,
-            plan_id, project_id, user_id, page_number, scale,
-            model_2d_json, target_drywalls,
+    if not model_2d.get("metadata", None):
+        row = await pg_fetch_one(
+            pool,
+            "SELECT model_2d->'metadata' AS metadata FROM models "
+            "WHERE LOWER(project_id) = LOWER($1) AND LOWER(plan_id) = LOWER($2) AND page_number = $3",
+            [project_id, plan_id, page_number],
+            query_name="insert_model_2d__fetch_metadata"
         )
-        log_json("INFO", "DB_EXECUTE", query="insert_model_2d", status=status)
-    finally:
-        await conn.close()
+        if row:
+            metadata = parse_jsonb(row["metadata"])
+            if metadata:
+                model_2d["metadata"] = metadata
+
+    model_2d_json = json.dumps(model_2d)
+
+    await pg_execute(
+        pool,
+        """
+        INSERT INTO models (
+            plan_id, project_id, user_id, page_number, scale,
+            model_2d, model_3d, takeoff, source, target_drywalls,
+            created_at, updated_at
+        ) VALUES (
+            $1, $2, $3, $4, $5,
+            $6::jsonb, '{}'::jsonb, '{}'::jsonb, $7, $8,
+            NOW(), NOW()
+        )
+        ON CONFLICT (LOWER(project_id), LOWER(plan_id), page_number)
+        DO UPDATE SET
+            model_2d = EXCLUDED.model_2d,
+            scale = CASE WHEN EXCLUDED.scale = '' THEN models.scale ELSE EXCLUDED.scale END,
+            user_id = EXCLUDED.user_id,
+            updated_at = NOW()
+        """,
+        [plan_id, project_id, user_id, page_number, scale,
+         model_2d_json, source, target_drywalls],
+        query_name="insert_model_2d"
+    )
+
+
+async def is_duplicate(pool, credentials, pdf_path, project_id):
+    """Check if a PDF with the same sha256 already exists for this project."""
+    sha_256 = sha256(pdf_path)
+    rows = await pg_fetch_all(
+        pool,
+        "SELECT plan_id, sha256, status FROM plans WHERE LOWER(project_id) = LOWER($1)",
+        [project_id],
+        query_name="is_duplicate"
+    )
+    for row in rows:
+        if row["sha256"] == sha_256:
+            if row["status"] == "FAILED":
+                await delete_plan(pool, credentials, row["plan_id"], project_id)
+                return False
+            return row["plan_id"]
+    return False
+
+
+async def delete_plan(pool, credentials, plan_id, project_id):
+    """Delete a plan row by project_id + plan_id."""
+    await pg_execute(
+        pool,
+        "DELETE FROM plans WHERE LOWER(project_id) = LOWER($1) AND LOWER(plan_id) = LOWER($2)",
+        [project_id, plan_id],
+        query_name="delete_plan"
+    )
 
 
 async def load_templates(pool, credentials):
     """Load SKU/drywall templates from the sku table."""
+    from fastapi.encoders import jsonable_encoder
     rows = await pg_fetch_all(pool, "SELECT * FROM sku", query_name="load_templates")
     product_templates_target = []
     cached_templates_sku = []
@@ -321,19 +312,15 @@ async def load_templates(pool, credentials):
 
 
 # ---------------------------------------------------------------------------
-# Non-DB Helpers (unchanged)
+# Non-DB Helpers
 # ---------------------------------------------------------------------------
 
-def download_floorplan(user_id, plan_id, project_id, credentials, index, destination_path="/tmp/floor_plan_wall_processed.png"):
-    client = get_gcs_client()
-    bucket = client.bucket(credentials["CloudStorage"]["bucket_name"])
-    blob_path = f"{project_id.lower()}/{plan_id.lower()}/{index}/floor_plan.png"
-    blob = bucket.blob(blob_path)
-    destination_path = Path(destination_path)
-    destination_path = destination_path.parent.joinpath(project_id).joinpath(plan_id).joinpath(user_id).joinpath(destination_path.name)
-    destination_path.parent.mkdir(parents=True, exist_ok=True)
-    blob.download_to_filename(destination_path)
-    return destination_path
+def sha256(path, chunk_size=8192):
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(chunk_size), b""):
+            h.update(chunk)
+    return h.hexdigest()
 
 
 def upload_floorplan(plan_path, plan_id, project_id, credentials, index=None, directory=None):
@@ -359,6 +346,16 @@ def upload_floorplan(plan_path, plan_id, project_id, credentials, index=None, di
     return f"gs://{credentials['CloudStorage']['bucket_name']}/{blob_path}"
 
 
+def load_floorplan_to_structured_2d_ID_token(credentials):
+    auth_req = google.auth.transport.requests.Request()
+    service_account_credentials = IDTokenCredentials.from_service_account_file(
+        credentials["service_drywall_account_key"],
+        target_audience=credentials["CloudRun"]["APIs"]["floorplan_to_structured_2d"]
+    )
+    service_account_credentials.refresh(auth_req)
+    return service_account_credentials.token
+
+
 def load_vertex_ai_client(credentials, region="us-central1"):
     with open(credentials["VertexAI"]["service_account_key"], 'r') as f:
         project_id = json.load(f)["project_id"]
@@ -368,60 +365,59 @@ def load_vertex_ai_client(credentials, region="us-central1"):
     return vertex_ai_client, generation_config
 
 
-def transcribe(credentials, hyperparameters, floor_plan_path):
-    transcriber = Transcriber(credentials, hyperparameters)
-    return transcriber.transcribe(floor_plan_path, [0, 1, -1, -2])
+def classify_plan(plan_path, vertex_ai_client_parameters):
+    """Classify a single page as FLOOR_PLAN or not, with dynamic downscaling."""
+    vertex_ai_client, vertex_ai_generation_config, vertex_ai_max_retry = vertex_ai_client_parameters
+    plan_BGR = cv2.imread(str(plan_path))
+    if plan_BGR is None:
+        log_json("ERROR", "CLASSIFY_PLAN_FAILED", error=f"Could not read image: {plan_path}")
+        return {"plan_type": "UNKNOWN", "confidence": 0.0}
 
+    # Dynamic downscaler: prevent massive payloads for Vertex AI
+    max_dim = 2048
+    h, w = plan_BGR.shape[:2]
+    if max(h, w) > max_dim:
+        scale = max_dim / max(h, w)
+        plan_BGR = cv2.resize(plan_BGR, (int(w * scale), int(h * scale)), interpolation=cv2.INTER_AREA)
 
-def phoenix_call(generate_content_lambda, max_retry=5, base_delay=1.0, pydantic_model=None):
-    """Call Vertex AI with retry logic and optional Pydantic validation."""
-    n_iterations = 0
-    temperature = 0
-    while n_iterations < max_retry:
+    _, canvas_buffer_array = cv2.imencode(".png", plan_BGR)
+    bytes_canvas = canvas_buffer_array.tobytes()
+    system = Content(role="model", parts=[Part.from_text(ARCHITECTURAL_DRAWING_CLASSIFIER)])
+    query = Content(role="user", parts=[
+        Part.from_data(data=bytes_canvas, mime_type="image/png"),
+        Part.from_text("Classify this architectural drawing.")
+    ])
+
+    for attempt in range(vertex_ai_max_retry):
         try:
-            response = generate_content_lambda(temperature)
-            if pydantic_model:
-                json_response = json.loads(response.text.strip("`json").replace("{{", '{').replace("}}", '}'))
-                response_json_pydantic = pydantic_model(**json_response)
-                return response_json_pydantic, json_response
-            return response.text
+            response = vertex_ai_client.generate_content(
+                [system, query],
+                generation_config=vertex_ai_generation_config,
+            )
+            response_text = response.text.strip()
+
+            # Bulletproof JSON extraction
+            json_match = re.search(r'\{.*\}', response_text, re.DOTALL)
+            if not json_match:
+                raise ValueError(f"No JSON object found in response: {response_text}")
+
+            clean_json_string = json_match.group(0)
+            classification = json.loads(clean_json_string)
+
+            validated = ArchitecturalDrawingClassifierResponse(**classification)
+            log_json("INFO", "CLASSIFY_PLAN_SUCCESS",
+                     plan_path=str(plan_path),
+                     plan_type=validated.plan_type)
+            return validated.model_dump()
         except (ResourceExhausted, ServiceUnavailable, DeadlineExceeded) as e:
-            n_iterations += 1
-            if n_iterations >= max_retry:
-                raise e
-            sleep_time = base_delay * (2 ** (n_iterations - 1)) + uniform(0, 0.5)
-            sleep(sleep_time)
-            log_json("WARNING", "PHOENIX_CALL_RETRY",
-                     attempt=n_iterations, max_retry=max_retry,
-                     reason="rate_limit_or_unavailable", error=str(e))
+            log_json("WARNING", "CLASSIFY_PLAN_RETRY", attempt=attempt + 1,
+                     max_retry=vertex_ai_max_retry, error=str(e))
+            sleep(uniform(1, 3))
         except Exception as e:
-            n_iterations += 1
-            if n_iterations >= max_retry:
-                raise e
-            temperature = min(0.5 * (n_iterations + 1) / max_retry, 0.5)
-            log_json("WARNING", "PHOENIX_CALL_RETRY",
-                     attempt=n_iterations, max_retry=max_retry,
-                     reason="parse_or_generation_error", error=str(e))
+            log_json("WARNING", "CLASSIFY_PLAN_RETRY", attempt=attempt + 1,
+                     max_retry=vertex_ai_max_retry, error=str(e))
+            sleep(uniform(1, 3))
 
-
-def load_section_from_page(wall_segmented_path, floor_plan_path, bounding_box_offset, section_name):
-    """Extract a section from a page using bounding box offset."""
-    offset_top_left = bounding_box_offset.get("offset_top_left", (0, 0))
-    offset_bottom_right = bounding_box_offset.get("offset_bottom_right", (1, 1))
-
-    floor_plan = cv2.imread(str(floor_plan_path))
-    wall_segmented = cv2.imread(str(wall_segmented_path))
-
-    if floor_plan is None or wall_segmented is None:
-        return wall_segmented_path
-
-    height, width = floor_plan.shape[:2]
-    x1 = int(offset_top_left[0] * width)
-    y1 = int(offset_top_left[1] * height)
-    x2 = int(offset_bottom_right[0] * width)
-    y2 = int(offset_bottom_right[1] * height)
-
-    wall_segmented_section = wall_segmented[y1:y2, x1:x2]
-    output_path = Path(str(wall_segmented_path)).parent / f"wall_segmented_{section_name}.png"
-    cv2.imwrite(str(output_path), wall_segmented_section)
-    return output_path
+    log_json("ERROR", "CLASSIFY_PLAN_EXHAUSTED", plan_path=str(plan_path),
+             max_retry=vertex_ai_max_retry)
+    return {"plan_type": "UNKNOWN", "confidence": 0.0}
