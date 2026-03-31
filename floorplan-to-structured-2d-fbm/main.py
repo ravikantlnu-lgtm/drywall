@@ -122,24 +122,51 @@ def floorplan_to_walls(credentials, project_id, plan_id, user_id, page_number, m
                  response_preview=response.text[:500])
         raise RuntimeError(f"Wall detector returned HTTP {response.status_code}")
 
+    if not output_path:
+        output_path = Path("/tmp/floor_plan_wall_segmented.png")
+
     content_type = response.headers.get("content-type", "")
-    if "image" not in content_type:
+
+    # Wall detector may return image bytes directly OR a JSON with GCS path
+    if "application/json" in content_type:
+        # New format: wall detector saved to GCS and returned the path
+        try:
+            result = response.json()
+            gcs_url = result.get("gcs_bucket_URL", "")
+            if not gcs_url:
+                raise RuntimeError("Wall detector returned JSON without gcs_bucket_URL")
+            log_json("INFO", "WALL_DETECTOR_GCS_RESPONSE",
+                     page_number=page_number, gcs_url=gcs_url)
+            # Download from GCS
+            client = get_gcs_client()
+            bucket_name = gcs_url.split("/")[2]
+            blob_path = "/".join(gcs_url.split("/")[3:])
+            bucket = client.bucket(bucket_name)
+            blob = bucket.blob(blob_path)
+            Path(output_path).parent.mkdir(parents=True, exist_ok=True)
+            blob.download_to_filename(str(output_path))
+        except Exception as e:
+            log_json("ERROR", "WALL_DETECTOR_GCS_DOWNLOAD_FAILED",
+                     page_number=page_number, error=str(e))
+            raise
+    elif "image" in content_type:
+        # Original format: raw image bytes
+        if len(response.content) < 1000:
+            log_json("WARNING", "WALL_DETECTOR_SMALL_RESPONSE",
+                     page_number=page_number,
+                     content_length=len(response.content))
+        Path(output_path).parent.mkdir(parents=True, exist_ok=True)
+        with open(output_path, "wb") as f:
+            f.write(response.content)
+    else:
         log_json("ERROR", "WALL_DETECTOR_BAD_CONTENT_TYPE",
                  content_type=content_type,
                  page_number=page_number,
                  response_preview=response.text[:500])
-        raise RuntimeError(f"Wall detector returned content-type '{content_type}', expected image")
+        raise RuntimeError(f"Wall detector returned unexpected content-type '{content_type}'")
 
-    if len(response.content) < 1000:
-        log_json("WARNING", "WALL_DETECTOR_SMALL_RESPONSE",
-                 page_number=page_number,
-                 content_length=len(response.content))
-
-    if not output_path:
-        output_path = Path("/tmp/floor_plan_wall_segmented.png")
-    with open(output_path, "wb") as f:
-        f.write(response.content)
     return Path(output_path)
+    
 
 
 def page_to_structured_2d(
