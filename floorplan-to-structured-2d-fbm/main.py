@@ -111,7 +111,7 @@ def floorplan_to_walls(credentials, project_id, plan_id, user_id, page_number, m
         f"{credentials['CloudRun']['APIs']['wall_detector']}/detect_wall",
         headers=headers,
         json=payload,
-        timeout=300,
+        timeout=600,
     )
 
     # Validate wall detector response
