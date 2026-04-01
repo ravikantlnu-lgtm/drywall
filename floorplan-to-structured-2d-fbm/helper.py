@@ -358,13 +358,47 @@ def upload_floorplan(plan_path, plan_id, project_id, credentials, index=None, di
     return f"gs://{credentials['CloudStorage']['bucket_name']}/{blob_path}"
 
 
-def load_vertex_ai_client(credentials, region="us-central1"):
+def load_vertex_ai_client(credentials, client_ip_address=None, prompts=None, region="us-central1"):
+    """Load a Vertex AI GenerativeModel, optionally with context caching.
+    
+    If prompts are provided, attempts to create a cached context for faster
+    repeated calls. Falls back to a plain model if caching fails.
+    
+    Returns:
+        (vertex_ai_client, generation_config, cache_enabled)
+    """
     with open(credentials["VertexAI"]["service_account_key"], 'r') as f:
         project_id = json.load(f)["project_id"]
     vertexai.init(project=project_id, location=region)
-    vertex_ai_client = GenerativeModel(credentials["VertexAI"]["llm"]["model_name"])
+    model_name = credentials["VertexAI"]["llm"]["model_name"]
     generation_config = credentials["VertexAI"]["llm"]["parameters"]
-    return vertex_ai_client, generation_config
+
+    if prompts:
+        try:
+            from vertexai.preview import caching as vertex_caching
+            system_instruction = "\n".join(prompts)
+            cached_content = vertex_caching.CachedContent.create(
+                model_name=model_name,
+                system_instruction=system_instruction,
+                expire_time=None,
+            )
+            vertex_ai_client = GenerativeModel.from_cached_content(cached_content)
+            log_json("INFO", "VERTEX_AI_CACHE_ENABLED", model=model_name)
+            return vertex_ai_client, generation_config, True
+        except Exception as e:
+            log_json("WARNING", "VERTEX_AI_CACHE_FAILED", error=str(e),
+                     detail="Falling back to plain model with system instruction")
+            # Fallback: return a factory that creates model with system instruction
+            system_instruction = "\n".join(prompts)
+            def model_factory(prompt_override=None):
+                return GenerativeModel(
+                    model_name,
+                    system_instruction=[prompt_override or system_instruction]
+                )
+            return model_factory, generation_config, False
+
+    vertex_ai_client = GenerativeModel(model_name)
+    return vertex_ai_client, generation_config, False
 
 
 def transcribe(credentials, hyperparameters, floor_plan_path):
