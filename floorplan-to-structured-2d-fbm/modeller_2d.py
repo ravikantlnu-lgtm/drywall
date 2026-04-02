@@ -12,6 +12,7 @@ from pathlib import Path
 from collections import defaultdict
 import subprocess
 from concurrent.futures import ThreadPoolExecutor
+from PIL import JpegImagePlugin 
 
 from fractions import Fraction
 from skimage.morphology import skeletonize
