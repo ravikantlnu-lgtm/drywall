@@ -166,7 +166,6 @@ def floorplan_to_walls(credentials, project_id, plan_id, user_id, page_number, m
         raise RuntimeError(f"Wall detector returned unexpected content-type '{content_type}'")
 
     return Path(output_path)
-    
 
 
 def page_to_structured_2d(
@@ -187,32 +186,78 @@ def page_to_structured_2d(
     verbose="False"
 ):
     """Process a single page section — kept from drywall_bq architecture."""
+    section_start = time_module.perf_counter()
+    page_number_padded = str(page_number).zfill(4)
+
     floor_plan_modeller_2d.reload()
+
+    # --- Sub-step: Load section from page ---
+    step_start = time_module.perf_counter()
     wall_segmented_sectioned_path = load_section_from_page(
         wall_segmented_path,
         floor_plan_processed_path,
         bounding_box_offset,
         page_section_number
     )
+    log_json("INFO", "STEP_COMPLETE", step="load_section_from_page",
+             page_number=page_number, section=page_section_number,
+             duration_ms=round((time_module.perf_counter() - step_start) * 1000, 2))
+
+    # --- Sub-step: 2D model generation (wall detection, polygonize, Vertex AI drywall prediction) ---
+    step_start = time_module.perf_counter()
     walls_2d, polygons, walls_2d_path, external_contour = floor_plan_modeller_2d.model(
         image_path=wall_segmented_sectioned_path,
-        model_2d_path=f"/tmp/{project_id}/{plan_id}/{user_id}/walls_2d_{str(page_number).zfill(4)}.json",
+        model_2d_path=f"/tmp/{project_id}/{plan_id}/{user_id}/walls_2d_{page_number_padded}.json",
         floor_plan_path=floor_plan_processed_path,
         transcription_block_with_centroids=transcription_block_with_centroids,
         transcription_headers_and_footers=transcription_headers_and_footers,
     )
+    log_json("INFO", "STEP_COMPLETE", step="model_2d",
+             page_number=page_number, section=page_section_number,
+             has_walls=walls_2d is not None, has_polygons=polygons is not None,
+             n_walls=len(walls_2d) if walls_2d else 0,
+             n_polygons=len(polygons) if polygons else 0,
+             duration_ms=round((time_module.perf_counter() - step_start) * 1000, 2))
+
     metadata = dict()
     if walls_2d and polygons:
+        # --- Sub-step: Load drywall & ceiling choices ---
+        step_start = time_module.perf_counter()
         floor_plan_modeller_2d.load_drywall_choices(walls_2d, polygons)
         floor_plan_modeller_2d.load_ceiling_choices(polygons)
+        log_json("INFO", "STEP_COMPLETE", step="load_drywall_choices",
+                 page_number=page_number, section=page_section_number,
+                 duration_ms=round((time_module.perf_counter() - step_start) * 1000, 2))
 
+        # --- Sub-step: Scale to SVG ---
+        step_start = time_module.perf_counter()
         floorplan_baseline, floorplan_page_statistics = FloorPlan2D.scale_to(
             floor_plan_path=floor_plan_processed_path
         )
+        log_json("INFO", "STEP_COMPLETE", step="scale_to_svg",
+                 page_number=page_number, section=page_section_number,
+                 duration_ms=round((time_module.perf_counter() - step_start) * 1000, 2))
+
+        # --- Sub-step: Upload SVG baseline ---
+        step_start = time_module.perf_counter()
         floorplan_baseline_page_source = upload_floorplan(
             floorplan_baseline, plan_id, project_id, credentials,
-            index=str(page_number).zfill(4)
+            index=page_number_padded
         )
+        log_json("INFO", "STEP_COMPLETE", step="upload_svg_baseline",
+                 page_number=page_number, section=page_section_number,
+                 duration_ms=round((time_module.perf_counter() - step_start) * 1000, 2))
+
+        # --- Sub-step: Save & upload 2D plot ---
+        step_start = time_module.perf_counter()
+        model_2d_path = floor_plan_modeller_2d.save_plot_2d(
+            walls_2d_path, floor_plan_path=floor_plan_processed_path
+        )
+        upload_floorplan(model_2d_path, plan_id, project_id, credentials,
+                         index=page_number_padded)
+        log_json("INFO", "STEP_COMPLETE", step="save_and_upload_2d_plot",
+                 page_number=page_number, section=page_section_number,
+                 duration_ms=round((time_module.perf_counter() - step_start) * 1000, 2))
 
         metadata = dict(
             size_in_bytes=floorplan_page_statistics["size"],
@@ -227,9 +272,8 @@ def page_to_structured_2d(
             drywall_choices_color_codes=floor_plan_modeller_2d.drywall_choices_color_codes,
         )
 
-    # --- DB write: insert_model_2d (now async PG, called via asyncio from sync thread) ---
-    # Since page_to_structured_2d runs in ThreadPoolExecutor, we need to schedule
-    # the async insert_model_2d on the event loop
+    # --- Sub-step: DB write insert_model_2d ---
+    step_start = time_module.perf_counter()
     loop = asyncio.new_event_loop()
     try:
         loop.run_until_complete(insert_model_2d(
@@ -244,14 +288,26 @@ def page_to_structured_2d(
             None,  # pool not used — insert_model_2d uses fresh asyncpg.connect
             credentials,
         ))
+        log_json("INFO", "STEP_COMPLETE", step="insert_model_2d",
+                 page_number=page_number, section=page_section_number,
+                 status="INSERT_SUCCESS",
+                 duration_ms=round((time_module.perf_counter() - step_start) * 1000, 2))
+    except Exception as e:
+        log_json("ERROR", "STEP_FAILED", step="insert_model_2d",
+                 page_number=page_number, section=page_section_number,
+                 error=f"{type(e).__name__}: {e}",
+                 duration_ms=round((time_module.perf_counter() - step_start) * 1000, 2))
+        raise
     finally:
         loop.close()
 
+    total_duration_ms = round((time_module.perf_counter() - section_start) * 1000, 2)
     log_json("INFO", "PAGE_SECTION_COMPLETE",
              page_number=page_number,
              page_section_number=page_section_number,
              has_walls=walls_2d is not None,
-             has_polygons=polygons is not None)
+             has_polygons=polygons is not None,
+             total_duration_ms=total_duration_ms)
 
 
 # ---------------------------------------------------------------------------
@@ -383,7 +439,7 @@ async def floorplan_to_structured_2d(request: Request):
         transcription_block_with_centroids, transcription_headers_and_footers = futures["transcriber"].result()
 
     # --- Step 3: Upload wall segmented image ---
-    async with timed_step("upload_wall_segmented", request_id=rid):
+    async with timed_step("upload_wall_segmented", request_id=rid, page_number=page_number):
         upload_floorplan(wall_segmented_path, plan_id, project_id, CREDENTIALS, index=page_number_padded)
 
     log_json("INFO", "STEP_COMPLETE", request_id=rid, step="wall_detection_and_transcription",
@@ -401,13 +457,17 @@ async def floorplan_to_structured_2d(request: Request):
     floorplan_baseline_page_source = None
 
     if not FloorPlan2D.is_none(wall_segmented_path):
-        floorplan_baseline, floorplan_page_statistics = FloorPlan2D.scale_to(
-            floor_plan_path=floor_plan_processed_path
-        )
-        floorplan_baseline_page_source = upload_floorplan(
-            floorplan_baseline, plan_id, project_id, CREDENTIALS,
-            index=page_number_padded
-        )
+        # --- Step 5a: Scale to SVG + upload baseline ---
+        async with timed_step("scale_to_svg", request_id=rid, page_number=page_number):
+            floorplan_baseline, floorplan_page_statistics = FloorPlan2D.scale_to(
+                floor_plan_path=floor_plan_processed_path
+            )
+
+        async with timed_step("upload_svg_baseline", request_id=rid, page_number=page_number):
+            floorplan_baseline_page_source = upload_floorplan(
+                floorplan_baseline, plan_id, project_id, CREDENTIALS,
+                index=page_number_padded
+            )
 
         # Handle bounding_box_offsets (multi-section pages)
         if not bounding_box_offsets:
@@ -417,8 +477,13 @@ async def floorplan_to_structured_2d(request: Request):
 
         ip_address = request.headers.get("X-Client-IP", (request.client.host if request.client else None))
 
-        async with timed_step("model_2d_generation", request_id=rid, page_number=page_number):
+        # --- Step 5b: Load Vertex AI clients ---
+        async with timed_step("load_vertex_ai_clients", request_id=rid, page_number=page_number):
             vertex_ai_clients = FloorPlan2D.load_vertex_ai_clients(CREDENTIALS, ip_address, templates)
+
+        # --- Step 5c: Process each section ---
+        async with timed_step("process_sections", request_id=rid, page_number=page_number,
+                              n_sections=len(bounding_box_offsets)):
             futures = list()
             with ThreadPoolExecutor(max_workers=2) as executor:
                 for bounding_box_offset in bounding_box_offsets:
